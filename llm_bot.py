@@ -1,5 +1,5 @@
 # LLM-Driven Data Bot with Tool Access
-import os, asyncio, json, traceback, ssl, logging
+import os, asyncio, json, traceback, ssl, logging, random
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
@@ -37,6 +37,18 @@ ANTHROPIC_MODEL_SQL = os.getenv("ANTHROPIC_MODEL_SQL", "claude-3-5-sonnet-202410
 # MCP Server path (local to this directory)
 SERVER_PATH = os.path.join(os.path.dirname(__file__), "aws_mcp_server.py")
 
+# Context window configuration - number of recent messages to include
+CONTEXT_WINDOW_SIZE = int(os.getenv("CONTEXT_WINDOW_SIZE", "5"))  # Adjust this value to control how many recent messages to include
+
+# Retry configuration for API calls
+MAX_RETRY_ATTEMPTS = int(os.getenv("MAX_RETRY_ATTEMPTS", "3"))  # Maximum number of retry attempts
+BASE_DELAY = float(os.getenv("BASE_DELAY", "1.0"))  # Base delay in seconds for exponential backoff
+MAX_DELAY = float(os.getenv("MAX_DELAY", "30.0"))  # Maximum delay in seconds
+
+# Context filtering configuration
+CONTEXT_SIMILARITY_THRESHOLD = float(os.getenv("CONTEXT_SIMILARITY_THRESHOLD", "0.30"))  # Similarity threshold for context relevance
+DISABLE_CONTEXT_FILTERING = os.getenv("DISABLE_CONTEXT_FILTERING", "false").lower() == "true"  # Disable context filtering entirely
+
 # System prompt for LLM with tool access
 SYSTEM_PROMPT = """You are a data analyst assistant for Mackolik with access to AWS Glue and Athena tools.
 
@@ -51,7 +63,7 @@ SYSTEM_PROMPT = """You are a data analyst assistant for Mackolik with access to 
 
 🚨 ABSOLUTE RULE: IF USER ASKS FOR REVENUE ANALYSIS WITHOUT MENTIONING ANDROID OR iOS, DO NOT MENTION ANDROID OR iOS IN YOUR RESPONSE! FOCUS ONLY ON THE REQUESTED DATABASE AND DATE RANGE!
 
-CONTEXT RESET: This is a NEW conversation. Ignore any previous context or conversations. Focus ONLY on the current user request.
+CONVERSATION CONTEXT: You have access to recent conversation history to provide context-aware responses. However, ALWAYS prioritize the current user question over historical context. If the current question is about a different topic than the historical context, focus entirely on the current question and ignore irrelevant historical context.
 
 Available tools:
 - glue_list_databases(): Get all available databases
@@ -109,6 +121,147 @@ Athena SQL Examples:
 - Aggregation: SELECT `dimension.date`, SUM(CAST(`column.total_line_item_level_cpm_and_cpc_revenue` AS DECIMAL(18,2))) AS total_revenue FROM gam_mackolik_prog.gam_mackolik_prog WHERE `dimension.date` = '2025-09-18' GROUP BY `dimension.date`
 - Date range: SELECT `dimension.date`, `column.revenue` FROM gam_mackolik_prog.gam_mackolik_prog WHERE `dimension.date` BETWEEN '2025-09-01' AND '2025-09-18' ORDER BY `dimension.date` DESC
 - Filtering: SELECT * FROM gam_mackolik_prog.gam_mackolik_prog WHERE `dimension.mobile_app_name` LIKE '%Android%' LIMIT 100"""
+
+async def exponential_backoff_delay(attempt: int) -> float:
+    """Calculate exponential backoff delay with jitter"""
+    delay = min(BASE_DELAY * (2 ** attempt), MAX_DELAY)
+    # Add jitter to prevent thundering herd
+    jitter = random.uniform(0.1, 0.3) * delay
+    return delay + jitter
+
+async def retry_with_backoff(func, *args, **kwargs):
+    """Retry a function with exponential backoff"""
+    last_exception = None
+    
+    for attempt in range(MAX_RETRY_ATTEMPTS + 1):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            last_exception = e
+            
+            # Check if this is a retryable error
+            error_str = str(e).lower()
+            is_retryable = any(keyword in error_str for keyword in [
+                'overloaded', 'rate limit', '429', '529', 'timeout', 
+                'connection', 'network', 'temporary', 'server error', '5xx'
+            ])
+            
+            if not is_retryable or attempt == MAX_RETRY_ATTEMPTS:
+                logger.error(f"Non-retryable error or max attempts reached: {e}")
+                raise e
+            
+            # Calculate delay and wait
+            delay = await exponential_backoff_delay(attempt)
+            logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {delay:.2f} seconds...")
+            await asyncio.sleep(delay)
+    
+    # This should never be reached, but just in case
+    raise last_exception
+
+async def _fetch_conversation_history(client, channel_id, limit):
+    """Internal function to fetch conversation history (used with retry logic)"""
+    response = await client.conversations_history(
+        channel=channel_id,
+        limit=limit,
+        inclusive=True  # Include the latest message
+    )
+    
+    if not response["ok"]:
+        raise Exception(f"Slack API error: {response.get('error', 'Unknown error')}")
+    
+    return response.get("messages", [])
+
+def filter_relevant_context(current_question, context_messages):
+    """Filter context messages to only include those relevant to the current question using semantic analysis"""
+    if not context_messages:
+        return []
+    
+    # If context filtering is disabled, return all context
+    if DISABLE_CONTEXT_FILTERING:
+        logger.info("Context filtering disabled - using all context messages")
+        return context_messages
+    
+    # Simple semantic similarity check using word overlap and length similarity
+    current_words = set(current_question.lower().split())
+    current_length = len(current_question)
+    
+    relevant_contexts = []
+    
+    for msg in context_messages:
+        context_text = msg.get("content", "")
+        context_words = set(context_text.lower().split())
+        context_length = len(context_text)
+        
+        # Calculate word overlap similarity
+        if current_words and context_words:
+            overlap = len(current_words.intersection(context_words))
+            word_similarity = overlap / len(current_words.union(context_words))
+        else:
+            word_similarity = 0
+        
+        # Calculate length similarity (questions of similar length are more likely to be related)
+        length_similarity = 1 - abs(current_length - context_length) / max(current_length, context_length, 1)
+        
+        # Combined similarity score
+        similarity_score = (word_similarity * 0.7) + (length_similarity * 0.3)
+        
+        # If similarity is high enough, consider it relevant
+        if similarity_score > CONTEXT_SIMILARITY_THRESHOLD:
+            relevant_contexts.append(msg)
+            logger.info(f"Context relevant (similarity: {similarity_score:.3f}): {context_text[:50]}...")
+        else:
+            logger.info(f"Context filtered out (similarity: {similarity_score:.3f}): {context_text[:50]}...")
+    
+    logger.info(f"Filtered to {len(relevant_contexts)} relevant context messages out of {len(context_messages)}")
+    return relevant_contexts
+
+async def fetch_conversation_context(client, channel_id, limit=CONTEXT_WINDOW_SIZE):
+    """Fetch recent conversation history from Slack channel with retry logic"""
+    try:
+        logger.info(f"Fetching last {limit} messages from channel {channel_id}")
+        
+        # Fetch conversation history with retry logic
+        messages = await retry_with_backoff(_fetch_conversation_history, client, channel_id, limit)
+        logger.info(f"Retrieved {len(messages)} messages from conversation history")
+        
+        # Filter out bot messages and format for LLM
+        context_messages = []
+        for msg in messages:
+            # Skip bot messages and messages without text
+            if msg.get("bot_id") or not msg.get("text"):
+                continue
+                
+            # Skip messages that are just mentions of the bot
+            text = msg.get("text", "").strip()
+            if not text or text.startswith("<@"):
+                continue
+            
+            # Skip very short messages that might not be meaningful context
+            if len(text) < 10:
+                continue
+                
+            # Skip messages that are just commands without questions
+            if text.startswith("/") and "?" not in text and "kaç" not in text and "ne" not in text:
+                continue
+                
+            # Format message for LLM context
+            user_id = msg.get("user", "unknown")
+            timestamp = msg.get("ts", "")
+            
+            context_messages.append({
+                "role": "user",
+                "content": text
+            })
+        
+        # Reverse to get chronological order (oldest first)
+        context_messages.reverse()
+        logger.info(f"Formatted {len(context_messages)} context messages")
+        
+        return context_messages
+        
+    except Exception as e:
+        logger.error(f"Error fetching conversation context: {e}")
+        return []
 
 async def extract_tool_result(mcp_result):
     """Extract JSON result from MCP response"""
@@ -198,32 +351,33 @@ async def call_llm_with_tools(messages, system_prompt, max_iterations=10):
                 logger.info(f"Iteration {iteration + 1}/{max_iterations}")
                 logger.info(f"Current messages count: {len(current_messages)}")
                 
-                # Call Anthropic with tool definitions
+                # Call Anthropic with tool definitions and retry logic
                 logger.info("Calling Anthropic API...")
-                try:
-                    response = await asyncio.to_thread(lambda: client.messages.create(
+                
+                async def _call_anthropic():
+                    return await asyncio.to_thread(lambda: client.messages.create(
                         model=ANTHROPIC_MODEL_CHAT,
                         max_tokens=4000,
                         system=system_prompt,
                         messages=current_messages,
                         tools=tool_definitions
                     ))
+                
+                try:
+                    response = await retry_with_backoff(_call_anthropic)
                     logger.info("Anthropic API response received")
                 except Exception as e:
-                    logger.error(f"Anthropic API error: {e}")
-                    if "429" in str(e) or "rate limit" in str(e).lower():
-                        logger.warning("Rate limit hit, returning current analysis")
-                        # Extract any text responses we have so far
-                        text_parts = []
-                        for msg in current_messages:
-                            if msg.get("role") == "assistant" and "content" in msg:
-                                for content in msg["content"]:
-                                    if content.get("type") == "text":
-                                        text_parts.append(content["text"])
-                        if text_parts:
-                            return "\n".join(text_parts)
-                        return "I encountered a rate limit while processing your request. Please try again in a moment."
-                    raise
+                    logger.error(f"Anthropic API error after all retries: {e}")
+                    # Extract any text responses we have so far
+                    text_parts = []
+                    for msg in current_messages:
+                        if msg.get("role") == "assistant" and "content" in msg:
+                            for content in msg["content"]:
+                                if content.get("type") == "text":
+                                    text_parts.append(content["text"])
+                    if text_parts:
+                        return "\n".join(text_parts)
+                    return f"I encountered an error while processing your request: {str(e)}. Please try again in a moment."
                 
                 # Add assistant's response to conversation
                 assistant_message = {"role": "assistant", "content": []}
@@ -349,12 +503,15 @@ async def call_llm_with_tools(messages, system_prompt, max_iterations=10):
                 })
                 
                 try:
-                    final_response = await asyncio.to_thread(lambda: client.messages.create(
-                        model=ANTHROPIC_MODEL_CHAT,
-                        max_tokens=4000,
-                        system=system_prompt,
-                        messages=current_messages
-                    ))
+                    async def _call_anthropic_final():
+                        return await asyncio.to_thread(lambda: client.messages.create(
+                            model=ANTHROPIC_MODEL_CHAT,
+                            max_tokens=5000,
+                            system=system_prompt,
+                            messages=current_messages
+                        ))
+                    
+                    final_response = await retry_with_backoff(_call_anthropic_final)
                     
                     # Extract final text response
                     text_parts = []
@@ -365,7 +522,7 @@ async def call_llm_with_tools(messages, system_prompt, max_iterations=10):
                     if text_parts:
                         return "\n".join(text_parts)
                 except Exception as e:
-                    logger.error(f"Error in final analysis: {e}")
+                    logger.error(f"Error in final analysis after all retries: {e}")
             
             return "I've completed the data analysis. Please check the results above."
 
@@ -415,8 +572,9 @@ async def ask_data(ack, respond, body, client):
     await ack()
     question = (body.get("text") or "").strip()
     user_id = body.get("user_id", "unknown")
+    channel_id = body.get("channel_id", "unknown")
     
-    logger.info(f"Received /ask-data command from user {user_id}: '{question}'")
+    logger.info(f"Received /ask-data command from user {user_id} in channel {channel_id}: '{question}'")
     
     if not question:
         logger.info("Empty question received, sending help message")
@@ -439,9 +597,19 @@ async def ask_data(ack, respond, body, client):
         await respond(f"🔍 Analyzing your question: '{question}'\nLet me check the available data sources...")
         logger.info("Sent initial response to user")
         
-        # Call LLM with tools - STRONG CONTEXT RESET
-        messages = [{"role": "user", "content": question}]
-        logger.info("Starting LLM processing...")
+        # Fetch conversation context (last t messages)
+        raw_context_messages = await fetch_conversation_context(client, channel_id, CONTEXT_WINDOW_SIZE)
+        logger.info(f"Fetched {len(raw_context_messages)} context messages")
+        
+        # Filter context to only include relevant messages
+        context_messages = filter_relevant_context(question, raw_context_messages)
+        
+        # Build messages array with context + current question
+        messages = context_messages + [{"role": "user", "content": question}]
+        logger.info(f"Total messages for LLM: {len(messages)} (context: {len(context_messages)}, current: 1)")
+        
+        # Call LLM with tools and context
+        logger.info("Starting LLM processing with context...")
         answer = await call_llm_with_tools(messages, system)
         logger.info(f"LLM processing completed, response length: {len(answer)}")
         
@@ -461,13 +629,14 @@ async def catalog(ack, respond, body, client):
 @app.command("/help")
 async def help_cmd(ack, respond, body, client):
     await ack()
-    help_text = """🤖 *LLM-Driven Data Assistant Help*
+    help_text = f"""🤖 *LLM-Driven Data Assistant Help*
 
 • `/ask-data <question>` - Ask any question about your data
   - Turkish: "Son 7 günde iOS DAU kaç?"
   - English: "Show me Android revenue for last month"
   
 • `/catalog` - Learn how to explore data
+• `/context` - Show current context window size
 • `/help` - Show this help
 
 *How it works:*
@@ -478,15 +647,50 @@ The AI automatically:
 4. 📊 Analyzes results
 5. 💬 Provides clear answers
 
+*Context Window:* Currently using last {CONTEXT_WINDOW_SIZE} messages for context
+
 No need to know database or table names - just ask naturally!"""
     
     await respond(help_text)
 
+@app.command("/context")
+async def context_cmd(ack, respond, body, client):
+    await ack()
+    context_text = f"""📊 *Bot Configuration*
+
+*Context Window:*
+- Size: **{CONTEXT_WINDOW_SIZE} messages**
+- Description: Bot includes last {CONTEXT_WINDOW_SIZE} messages as context
+- Smart Filtering: **{'Disabled' if DISABLE_CONTEXT_FILTERING else 'Enabled'}**
+- Similarity Threshold: **{CONTEXT_SIMILARITY_THRESHOLD}**
+
+*Retry Logic:*
+- Max attempts: **{MAX_RETRY_ATTEMPTS}**
+- Base delay: **{BASE_DELAY}s**
+- Max delay: **{MAX_DELAY}s**
+- Description: Automatic retry with exponential backoff for API failures
+
+*Environment Variables:*
+- `CONTEXT_WINDOW_SIZE={CONTEXT_WINDOW_SIZE}` (0=no context, 1-10=limited, 20+=extensive)
+- `MAX_RETRY_ATTEMPTS={MAX_RETRY_ATTEMPTS}` (1-5 recommended)
+- `BASE_DELAY={BASE_DELAY}` (0.5-2.0 seconds)
+- `MAX_DELAY={MAX_DELAY}` (10-60 seconds)
+- `CONTEXT_SIMILARITY_THRESHOLD={CONTEXT_SIMILARITY_THRESHOLD}` (0.1-0.5, higher=stricter filtering)
+- `DISABLE_CONTEXT_FILTERING={'true' if DISABLE_CONTEXT_FILTERING else 'false'}` (disable smart filtering)
+
+*Benefits:*
+✅ Reduced API costs with limited context
+✅ Automatic retry for temporary failures
+✅ Better reliability during high load"""
+    
+    await respond(context_text)
+
 @app.event("app_mention")
-async def handle_mentions(body, say):
+async def handle_mentions(body, say, client):
     ev = body.get("event", {}) or {}
     raw = ev.get("text", "") or ""
     user_id = ev.get("user", "unknown")
+    channel_id = ev.get("channel", "unknown")
     
     # Get bot user ID from the event
     bot_id = body.get("authed_users", [None])[0] if body.get("authed_users") else None
@@ -504,7 +708,7 @@ async def handle_mentions(body, say):
         # Fallback to old method
         txt = raw.replace("<@U1234567890>", "").strip()
     
-    logger.info(f"Received mention from user {user_id}: '{txt}'")
+    logger.info(f"Received mention from user {user_id} in channel {channel_id}: '{txt}'")
     
     if not txt:
         logger.info("Empty mention received, sending help message")
@@ -526,9 +730,19 @@ async def handle_mentions(body, say):
         await say(f"🔍 Processing: '{txt}'...")
         logger.info("Sent initial response to user")
         
-        # STRONG CONTEXT RESET
-        messages = [{"role": "user", "content": txt}]
-        logger.info("Starting LLM processing for mention...")
+        # Fetch conversation context (last t messages)
+        raw_context_messages = await fetch_conversation_context(client, channel_id, CONTEXT_WINDOW_SIZE)
+        logger.info(f"Fetched {len(raw_context_messages)} context messages for mention")
+        
+        # Filter context to only include relevant messages
+        context_messages = filter_relevant_context(txt, raw_context_messages)
+        
+        # Build messages array with context + current question
+        messages = context_messages + [{"role": "user", "content": txt}]
+        logger.info(f"Total messages for LLM mention: {len(messages)} (context: {len(context_messages)}, current: 1)")
+        
+        # Call LLM with tools and context
+        logger.info("Starting LLM processing for mention with context...")
         answer = await call_llm_with_tools(messages, system)
         logger.info(f"LLM processing completed for mention, response length: {len(answer)}")
         
@@ -556,6 +770,9 @@ async def main():
     logger.info("Starting LLM Bot...")
     logger.info(f"Anthropic model: {ANTHROPIC_MODEL_CHAT}")
     logger.info(f"MCP server path: {SERVER_PATH}")
+    logger.info(f"Context window size: {CONTEXT_WINDOW_SIZE} messages")
+    logger.info(f"Retry configuration: {MAX_RETRY_ATTEMPTS} attempts, base delay: {BASE_DELAY}s, max delay: {MAX_DELAY}s")
+    logger.info(f"Context filtering: {'disabled' if DISABLE_CONTEXT_FILTERING else 'enabled'}, similarity threshold: {CONTEXT_SIMILARITY_THRESHOLD}")
     
     handler = AsyncSocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
     logger.info("Socket mode handler created, starting...")
